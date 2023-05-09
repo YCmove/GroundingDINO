@@ -53,8 +53,39 @@ def get_sine_pos_embed(
     return pos_res
 
 
+# def convert_ratio(bboxes, w, h):
+#     # mask = torch.zeros(h,w).unsqueeze(0).bool()
+#     mask = torch.ones(h,w).unsqueeze(0).bool()
+#     for x_center_ratio, y_center_ratio, w_ratio, h_ratio in bboxes:
+
+#         # -1 help converting to idx
+#         # x_left = math.floor((x_center_ratio - w_ratio/2.0) * w)-1
+#         # x_right = math.ceil((xannota_center_ratio + w_ratio/2.0) * w)-1
+#         # y_top = math.floor((y_center_ratio - h_ratio/2.0) * h)-1
+#         # y_down = math.ceil((y_center_ratio + h_ratio/2.0) * h)-1
+#         x_left = int(torch.round((x_center_ratio - w_ratio/2.0) * w).item()-1)
+#         x_right = int(torch.round((x_center_ratio + w_ratio/2.0) * w).item()-1)
+#         y_top = int(torch.round((y_center_ratio - h_ratio/2.0) * h).item()-1)
+#         y_down = int(torch.round((y_center_ratio + h_ratio/2.0) * h).item()-1)
+
+#         x_left = 0 if x_left < 0 else x_left
+#         x_right = w-1 if x_right > w else x_right
+#         y_top = 0 if y_top < 0 else y_top
+#         y_down = h-1 if y_down > h else y_down
+
+#         # mask[:,y_top:y_down+1,x_left:x_right+1] = True
+#         mask[:,y_top:y_down+1,x_left:x_right+1] = False
+#         # print(f'w={w}, h={h}, [:,{y_top}:{y_down+1},{x_left}:{x_right+1}]')
+
+    
+    # return mask
+     
+
+
+
+
 def gen_encoder_output_proposals(
-    memory: Tensor, memory_padding_mask: Tensor, spatial_shapes: Tensor, learnedwh=None
+    bboxes, memory: Tensor, memory_padding_mask: Tensor, spatial_shapes: Tensor, learnedwh=None
 ):
     """
     Input:
@@ -68,8 +99,10 @@ def gen_encoder_output_proposals(
     """
     N_, S_, C_ = memory.shape
     proposals = []
+    masks_hack = []
     _cur = 0
     for lvl, (H_, W_) in enumerate(spatial_shapes):
+
         mask_flatten_ = memory_padding_mask[:, _cur : (_cur + H_ * W_)].view(N_, H_, W_, 1)
         valid_H = torch.sum(~mask_flatten_[:, :, 0, 0], 1)
         valid_W = torch.sum(~mask_flatten_[:, 0, :, 0], 1)
@@ -96,13 +129,27 @@ def gen_encoder_output_proposals(
         # wh = torch.ones_like(grid) / scale
         proposal = torch.cat((grid, wh), -1).view(N_, -1, 4)
         proposals.append(proposal)
+
+        # if bboxes is not None:
+        #     mask_hack = convert_ratio(bboxes, W_, H_)
+        #     mask_hack = mask_hack.view(N_, -1)
+        #     masks_hack.append(mask_hack)
         _cur += H_ * W_
     # import ipdb; ipdb.set_trace()
+
+
     output_proposals = torch.cat(proposals, 1)
+
+    # hack
+    # if bboxes is not None:
+    #     memory_padding_mask = torch.cat(masks_hack, 1).to('cuda:0')
+
     output_proposals_valid = ((output_proposals > 0.01) & (output_proposals < 0.99)).all(
         -1, keepdim=True
     )
     output_proposals = torch.log(output_proposals / (1 - output_proposals))  # unsigmoid
+
+    # memory_padding_mask: if mask=True, replace with inf
     output_proposals = output_proposals.masked_fill(memory_padding_mask.unsqueeze(-1), float("inf"))
     output_proposals = output_proposals.masked_fill(~output_proposals_valid, float("inf"))
 
@@ -110,10 +157,8 @@ def gen_encoder_output_proposals(
     output_memory = output_memory.masked_fill(memory_padding_mask.unsqueeze(-1), float(0))
     output_memory = output_memory.masked_fill(~output_proposals_valid, float(0))
 
-    # output_memory = output_memory.masked_fill(memory_padding_mask.unsqueeze(-1), float('inf'))
-    # output_memory = output_memory.masked_fill(~output_proposals_valid, float('inf'))
-
     return output_memory, output_proposals
+    # return output_memory, output_proposals, memory_padding_mask
 
 
 class RandomBoxPerturber:
@@ -204,6 +249,10 @@ def _get_activation_fn(activation, d_model=256, batch_dim=0):
 def gen_sineembed_for_position(pos_tensor):
     # n_query, bs, _ = pos_tensor.size()
     # sineembed_tensor = torch.zeros(n_query, bs, 256)
+
+    # print(f'[gen_sineembed_for_position] 0 pos_tensor={pos_tensor.shape}, {pos_tensor}')
+
+
     scale = 2 * math.pi
     dim_t = torch.arange(128, dtype=torch.float32, device=pos_tensor.device)
     dim_t = 10000 ** (2 * (torch.div(dim_t, 2, rounding_mode='floor')) / 128)
@@ -211,6 +260,10 @@ def gen_sineembed_for_position(pos_tensor):
     y_embed = pos_tensor[:, :, 1] * scale
     pos_x = x_embed[:, :, None] / dim_t
     pos_y = y_embed[:, :, None] / dim_t
+    # print(f'[gen_sineembed_for_position] 1 x_embed={x_embed.shape}, {x_embed[:5]}')
+    # print(f'[gen_sineembed_for_position] 1 y_embed={y_embed.shape}, {y_embed[:5]}')
+    # print(f'[gen_sineembed_for_position] 1 pos_x={pos_x.shape}, {pos_x[:5]}')
+    # print(f'[gen_sineembed_for_position] 1 pos_y={pos_y.shape}, {pos_y[:5]}')
     pos_x = torch.stack((pos_x[:, :, 0::2].sin(), pos_x[:, :, 1::2].cos()), dim=3).flatten(2)
     pos_y = torch.stack((pos_y[:, :, 0::2].sin(), pos_y[:, :, 1::2].cos()), dim=3).flatten(2)
     if pos_tensor.size(-1) == 2:
@@ -227,6 +280,8 @@ def gen_sineembed_for_position(pos_tensor):
         pos = torch.cat((pos_y, pos_x, pos_w, pos_h), dim=2)
     else:
         raise ValueError("Unknown pos_tensor shape(-1):{}".format(pos_tensor.size(-1)))
+    
+    # print(f'[gen_sineembed_for_position] Final pos={pos.shape}, {pos[:5]}')
     return pos
 
 

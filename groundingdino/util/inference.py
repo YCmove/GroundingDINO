@@ -1,3 +1,4 @@
+import pprint
 from typing import Tuple, List
 
 import cv2
@@ -11,7 +12,8 @@ import groundingdino.datasets.transforms as T
 from groundingdino.models import build_model
 from groundingdino.util.misc import clean_state_dict
 from groundingdino.util.slconfig import SLConfig
-from groundingdino.util.utils import get_phrases_from_posmap
+from groundingdino.util.utils import get_phrases_from_posmap, get_phrases_from_posmap_all
+
 
 # ----------------------------------------------------------------------------------------------------------------------
 # OLD API
@@ -51,47 +53,176 @@ def load_image(image_path: str) -> Tuple[np.array, torch.Tensor]:
 
 def predict(
         model,
+        bboxes,
         image: torch.Tensor,
         caption: str,
         box_threshold: float,
         text_threshold: float,
-        device: str = "cuda"
+        device: str = "cuda",
 ) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
+    
+    pp = pprint.PrettyPrinter(indent=4)
+
+    process_caption = caption.replace(' ', '')
+    input_classes = [preprocess_caption(i).replace('.', '') for i in caption.split(',')]
+
     caption = preprocess_caption(caption=caption)
 
     model = model.to(device)
     image = image.to(device)
 
     with torch.no_grad():
-        outputs = model(image[None], captions=[caption])
+        outputs = model(bboxes, image[None], captions=[caption])
 
+    #prediction_logits = outputs["pred_logits"].cpu()[0]  # prediction_logits.shape = (nq, 256)
+
+    # Softmax
+    #prediction_logits = outputs["pred_logits"].cpu().softmax(dim=1)[0]
+
+    # Sigmoid
     prediction_logits = outputs["pred_logits"].cpu().sigmoid()[0]  # prediction_logits.shape = (nq, 256)
     prediction_boxes = outputs["pred_boxes"].cpu()[0]  # prediction_boxes.shape = (nq, 4)
 
-    all_prediction_logits = outputs["all_pred_logits"].cpu().sigmoid()[0]  # prediction_logits.shape = (nq, 256)
-    all_prediction_boxes = outputs["all_pred_boxes"].cpu()[0]  # prediction_boxes.shape = (nq, 4)
-
-    mask = prediction_logits.max(dim=1)[0] > box_threshold
-    logits = prediction_logits[mask]  # logits.shape = (n, 256)
-    boxes = prediction_boxes[mask]  # boxes.shape = (n, 4)
-
-    print(f'mask.shape={mask.shape}')
-    print(f'logits.shape={logits.shape}')
-    print(f'boxes.shape={boxes.shape}')
-    print(f'all_prediction_logits.shape={all_prediction_logits.shape}')
-    print(f'all_prediction_boxes.shape={all_prediction_boxes.shape}')
-
+    # all_prediction_logits = outputs["all_pred_logits"].cpu().sigmoid()  # prediction_logits.shape = (nq, 256)
+    # all_prediction_boxes = outputs["all_pred_boxes"].cpu()  # prediction_boxes.shape = (nq, 4)
 
     tokenizer = model.tokenizer
     tokenized = tokenizer(caption)
 
-    phrases = [
-        get_phrases_from_posmap(logit > text_threshold, tokenized, tokenizer).replace('.', '')
-        for logit
-        in logits
-    ]
+    #print(f'[def predict] caption={caption}')
+    #print(f'[def predict] tokenized={tokenized}')
 
-    return boxes, logits.max(dim=1)[0], phrases
+
+    mask = prediction_logits.max(dim=1)[0] > box_threshold
+    logits_masked = prediction_logits[mask]  # logits.shape = (n, 256)
+    pred_bboxes = prediction_boxes[mask]  # boxes.shape = (n, 4)
+
+    # No mask based on threshold
+    #logits = prediction_logits  # logits.shape = (n, 256)
+    # boxes = prediction_boxes  # boxes.shape = (n, 4)
+
+    
+
+    # test_token_ids = tokenized["input_ids"]
+    # test_token_decoded = tokenizer.decode(test_token_ids)
+    splited_captions_and_special = [tokenizer.decode(i) for i in tokenized["input_ids"]]
+
+    special_token_idxs = []
+    valid_tokens = []
+    valid_tokens_idxs = []
+    special_tokens = ["[CLS]", "[SEP]", ",", ".", "?"]
+
+    for idx, input_id in enumerate(tokenized["input_ids"]):
+
+        token_str = tokenizer.decode([input_id])
+        if token_str in special_tokens:
+            special_token_idxs.append(idx)
+        else:
+            valid_tokens.append(tokenizer.decode([input_id]))
+            valid_tokens_idxs.append(idx)
+
+        # print(f'input_id={input_id}, decode={tokenizer.decode([input_id])}')
+
+    prediction_raw_logits = outputs["pred_logits"].cpu()[0]
+    token_logits_raw_unmasked = prediction_raw_logits[:len(bboxes), valid_tokens_idxs]
+    token_logits_unmasked = prediction_logits[:len(bboxes), valid_tokens_idxs]
+    pred_bboxes_unmasked = prediction_boxes[:len(bboxes), :]
+    
+    tokenidx2class, class2tokenidx = {}, {}
+    sub_token_idx_ptr = 0
+
+    for classname_idx, classname in enumerate(input_classes):
+        
+        class2tokenidx[classname_idx] = []
+        per_classname_tokenized = tokenizer(classname)
+        splited_captions_and_special = [tokenizer.decode(i) for i in per_classname_tokenized["input_ids"]]
+        sub_tokens = [i.replace('#', '') for i in splited_captions_and_special if i not in special_tokens]
+        # print(f'[Token mapping] {classname}(#{classname_idx}) tokenlized to {sub_tokens}')
+
+        for sub_token_idx, sub_token in enumerate(sub_tokens):
+            sub_token_idx_ptr += sub_token_idx
+            tokenidx2class[sub_token_idx_ptr] = (sub_token, classname_idx, classname)
+            class2tokenidx[classname_idx].append((sub_token, sub_token_idx_ptr, classname))
+
+            if sub_token_idx+1 == len(sub_tokens):
+                sub_token_idx_ptr += 1
+
+    # print(f'\n----- tokenidx2class -----')
+    # pp.pprint(tokenidx2class)
+    # print('')
+
+    phrases = []
+    for logit in logits_masked:
+        # print(f'logit={logit}, logit > text_threshold({text_threshold}) = {logit > text_threshold}')
+        #phrases_combine, phrases_split = get_phrases_from_posmap(logit, tokenized, tokenizer)
+        phrases_combine, phrases_split = get_phrases_from_posmap(logit > text_threshold, tokenized, tokenizer)
+        phrases_combine = phrases_combine.replace('.', '')
+        phrases_split = [i.replace('.', '') for i in phrases_split]
+
+        # if len(phrases_split) > 1:
+        #     print(f'split={phrases_split}, combine={phrases_combine}')
+        #     print(f'logit={logit}')
+        #     tmp = logit > text_threshold
+        #     non_zero_idx = tmp.nonzero(as_tuple=True)[0].tolist()
+        #     print(f'non_zero_idx={non_zero_idx}')
+        #     print('-------------')
+
+        phrases.append(phrases_combine)
+        # print('-----')
+
+    assert logits_masked.shape[0] == len(phrases)
+
+
+    # specical_tokens = tokenizer.convert_tokens_to_ids(["[CLS]", "[SEP]", ".", "?"])
+    # print(f'tokenizer.decode={test_token_decoded}')
+    # print(f'type of tokenizer.decode={type(test_token_decoded)}')
+
+
+
+
+    # highest_token_idx = token_logits.max(dim=1)[1]
+    # tokenidx2class[highest_token_idx]
+    assert token_logits_unmasked.shape[1] == len(tokenidx2class), 'number of tokenlized strings should be the same'
+    #####################################################
+    #         Merge token_logits to class_logits        #
+    #            Filter by Highest value or ?           #
+    #####################################################
+    class_logits = None
+    class_logits_raw = None
+    for classname_idx, sub_token_list in class2tokenidx.items():
+        # sub_token, sub_token_idx_ptr, classname
+        classname = sub_token_list[0][2]
+        sub_token_idxs = [i[1] for i in sub_token_list]
+        # print(f'{classname} has sub_token_idxs={sub_token_idxs}')
+
+        ##########################################
+        #           per class logits             #
+        ##########################################
+        per_class_logits = token_logits_unmasked[:, sub_token_idxs]
+        per_class_logits_max = per_class_logits.max(dim=1)[0].unsqueeze(1)
+        #per_class_logits_mean = per_class_logits.mean(dim=1, keepdim=True)
+        per_class_logits = per_class_logits_max
+
+        if class_logits is None:
+            class_logits = per_class_logits
+        else:
+            class_logits = torch.cat((class_logits, per_class_logits), 1)
+
+        #############################################
+        #           per class logits raw            #
+        #############################################
+        per_class_logits_raw = token_logits_raw_unmasked[:, sub_token_idxs]
+        per_class_logits_raw_max = per_class_logits_raw.max(dim=1)[0].unsqueeze(1)
+        per_class_logits_raw = per_class_logits_raw_max
+        if class_logits_raw is None:
+            class_logits_raw = per_class_logits_raw
+        else:
+            class_logits_raw = torch.cat((class_logits_raw, per_class_logits_raw), 1)
+
+
+    # all return objects are in cpu
+    assert pred_bboxes.shape[0] == len(phrases)
+    return pred_bboxes, pred_bboxes_unmasked, logits_masked.max(dim=1)[0], phrases, valid_tokens, token_logits_unmasked, token_logits_raw_unmasked, class_logits, class_logits_raw, mask.tolist(), tokenidx2class, class2tokenidx
 
 
 def annotate(image_source: np.ndarray, boxes: torch.Tensor, logits: torch.Tensor, phrases: List[str]) -> np.ndarray:
@@ -106,7 +237,7 @@ def annotate(image_source: np.ndarray, boxes: torch.Tensor, logits: torch.Tensor
         in zip(phrases, logits)
     ]
 
-    box_annotator = sv.BoxAnnotator()
+    box_annotator = sv.BoxAnnotator(text_scale=0.5, thickness=1)
     annotated_frame = cv2.cvtColor(image_source, cv2.COLOR_RGB2BGR)
     annotated_frame = box_annotator.annotate(scene=annotated_frame, detections=detections, labels=labels)
     return annotated_frame

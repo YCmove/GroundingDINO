@@ -209,7 +209,7 @@ class GroundingDINO(nn.Module):
     def init_ref_points(self, use_num_queries):
         self.refpoint_embed = nn.Embedding(use_num_queries, self.query_dim)
 
-    def forward(self, samples: NestedTensor, targets: List = None, **kw):
+    def forward(self, bboxes, samples: NestedTensor, targets: List = None, **kw):
         """The forward expects a NestedTensor, which consists of:
            - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
            - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
@@ -311,8 +311,13 @@ class GroundingDINO(nn.Module):
 
         input_query_bbox = input_query_label = attn_mask = dn_meta = None
         hs, reference, hs_enc, ref_enc, init_box_proposal = self.transformer(
-            srcs, masks, input_query_bbox, poss, input_query_label, attn_mask, text_dict
+            bboxes, srcs, masks, input_query_bbox, poss, input_query_label, attn_mask, text_dict
         )
+
+        # print(f'rlen of reference={len(reference)}, {reference[0].shape}')
+        # print(f'hs_enc.shape={hs_enc.shape}')
+        # print(f'ref_enc.shape={ref_enc.shape}')
+        # print(f'init_box_proposal.shape={init_box_proposal.shape}')
 
         # deformable-detr-like anchor update
         outputs_coord_list = []
@@ -336,17 +341,24 @@ class GroundingDINO(nn.Module):
                "all_pred_logits": outputs_class, "all_pred_boxes": outputs_coord_list}
         # out = {"pred_logits": outputs_class, "pred_boxes": outputs_coord_list[-1]}
 
-        # # for intermediate outputs
-        # if self.aux_loss:
-        #     out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord_list)
+        # for intermediate outputs
+        if self.aux_loss:
+            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord_list)
+            # print(f"len of aux_outputs={len(out['aux_outputs'])}")
+            # print(f"aux_outputs pred_logits={out['aux_outputs'][0]['pred_logits'].shape}")
+            # print(f"aux_outputs pred_boxes={out['aux_outputs'][0]['pred_boxes'].shape}")
 
-        # # for encoder output
-        # if hs_enc is not None:
-        #     # prepare intermediate outputs
-        #     interm_coord = ref_enc[-1]
-        #     interm_class = self.transformer.enc_out_class_embed(hs_enc[-1], text_dict)
-        #     out['interm_outputs'] = {'pred_logits': interm_class, 'pred_boxes': interm_coord}
-        #     out['interm_outputs_for_matching_pre'] = {'pred_logits': interm_class, 'pred_boxes': init_box_proposal}
+        # for encoder output
+        if hs_enc is not None:
+            # prepare intermediate outputs
+            interm_coord = ref_enc[-1]
+            interm_class = self.transformer.enc_out_class_embed(hs_enc[-1], text_dict)
+            out['interm_outputs'] = {'pred_logits': interm_class, 'pred_boxes': interm_coord}
+            out['interm_outputs_for_matching_pre'] = {'pred_logits': interm_class, 'pred_boxes': init_box_proposal}
+
+            # print(f'[encoder output] text_dict={text_dict}')
+            # print(f'[encoder output] interm_class.shape={interm_class.shape}')
+            
 
         return out
 

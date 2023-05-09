@@ -603,6 +603,22 @@ def get_phrases_from_posmap(
     if posmap.dim() == 1:
         non_zero_idx = posmap.nonzero(as_tuple=True)[0].tolist()
         token_ids = [tokenized["input_ids"][i] for i in non_zero_idx]
+
+        # for t_id in token_ids:
+        #     print(f'[get_phrases_from_posmap] t_id={t_id}, decode={tokenizer.decode([t_id])}')
+
+        return tokenizer.decode(token_ids), [tokenizer.decode(i) for i in token_ids]
+    else:
+        raise NotImplementedError("posmap must be 1-dim")
+
+
+def get_phrases_from_posmap_all(
+    posmap: torch.BoolTensor, tokenized: Dict, tokenizer: AutoTokenizer
+):
+    assert isinstance(posmap, torch.Tensor), "posmap must be torch.Tensor"
+    if posmap.dim() == 1:
+        non_zero_idx = posmap.nonzero(as_tuple=True)[0].tolist()
+        token_ids = [tokenized["input_ids"][i] for i in non_zero_idx]
         return tokenizer.decode(token_ids)
     else:
         raise NotImplementedError("posmap must be 1-dim")

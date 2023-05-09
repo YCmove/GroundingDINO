@@ -208,7 +208,7 @@ class Transformer(nn.Module):
     def init_ref_points(self, use_num_queries):
         self.refpoint_embed = nn.Embedding(use_num_queries, 4)
 
-    def forward(self, srcs, masks, refpoint_embed, pos_embeds, tgt, attn_mask=None, text_dict=None):
+    def forward(self, bboxes, srcs, masks, refpoint_embed, pos_embeds, tgt, attn_mask=None, text_dict=None):
         """
         Input:
             - srcs: List of multi features [bs, ci, hi, wi]
@@ -256,6 +256,7 @@ class Transformer(nn.Module):
         # Begin Encoder
         #########################################################
         memory, memory_text = self.encoder(
+            bboxes,
             src_flatten,
             pos=lvl_pos_embed_flatten,
             level_start_index=level_start_index,
@@ -282,8 +283,10 @@ class Transformer(nn.Module):
         #         import ipdb; ipdb.set_trace()
 
         if self.two_stage_type == "standard":
+            # output_memory, output_proposals, mask_flatten = gen_encoder_output_proposals(
             output_memory, output_proposals = gen_encoder_output_proposals(
-                memory, mask_flatten, spatial_shapes
+                # memory, mask_flatten, spatial_shapes
+                None, memory, mask_flatten, spatial_shapes
             )
             output_memory = self.enc_output_norm(self.enc_output(output_memory))
 
@@ -292,22 +295,61 @@ class Transformer(nn.Module):
             else:
                 enc_outputs_class_unselected = self.enc_out_class_embed(output_memory)
 
+            
             topk_logits = enc_outputs_class_unselected.max(-1)[0]
+
+            topk_proposals_hack = (mask_flatten[0] == False).nonzero().transpose(0, 1)
+
+            # print(f'[Transformer encoder] enc_outputs_class_unselected={enc_outputs_class_unselected.shape}')
+            # print(f'[Transformer encoder] topk_logits={topk_logits.shape}')
+
             enc_outputs_coord_unselected = (
                 self.enc_out_bbox_embed(output_memory) + output_proposals
             )  # (bs, \sum{hw}, 4) unsigmoid
             topk = self.num_queries
 
             topk_proposals = torch.topk(topk_logits, topk, dim=1)[1]  # bs, nq
+            # print(f'[class Transformer Origin] topk_proposals={topk_proposals.shape}')
+            # print(f'[class Transformer Hack] topk_proposals_hack={topk_proposals_hack.shape}')
 
+            # hack
+            # import numpy as np
+            # intersect = np.intersect1d(topk_proposals[0].cpu(), topk_proposals_hack[0].cpu())
+            # diff = np.setdiff1d(topk_proposals[0].cpu(), topk_proposals_hack[0].cpu())
+            # print(f'[class Transformer Hack] intersect={intersect.shape}')
+            # print(f'[class Transformer Hack] diff={diff.shape}')
+
+            # if bboxes is not None:
+
+            #     if topk_proposals_hack.shape[1] > 900:
+            #         topk_proposals_hack = topk_proposals_hack[:,:900]
+            #     elif topk_proposals_hack.shape[1] < 900:
+            #         num = 900 - topk_proposals_hack.shape[1]
+            #         diff = torch.Tensor(diff[:num]).type(torch.int64).unsqueeze(0).to('cuda:0')
+            #         topk_proposals_hack = torch.cat((topk_proposals_hack, diff), 1)
+            
+            #     topk_proposals = topk_proposals_hack
+
+            # print(f'[Transformer encoder] topk={topk}')
+            # print(f'[Transformer encoder] topk_proposals={topk_proposals.shape}')
             # gather boxes
             refpoint_embed_undetach = torch.gather(
                 enc_outputs_coord_unselected, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4)
             )  # unsigmoid
             refpoint_embed_ = refpoint_embed_undetach.detach()
+
+            # print(f'[Transformer encoder two-stage=standard] refpoint_embed_={refpoint_embed_.shape} {refpoint_embed_[0,300,:]}')
+
             init_box_proposal = torch.gather(
                 output_proposals, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4)
             ).sigmoid()  # sigmoid
+
+            # print(f'[Transformer encoder two-stage=standard] init_box_proposal={init_box_proposal.shape} {init_box_proposal[0,300,:]}')
+
+            # init_box_proposal = init_box_proposal[:,-3:,:]
+            #init_box_proposal = init_box_proposal[:,:3,:]
+            #print(f'[Transformer encoder two-stage=standard] init_box_proposal={init_box_proposal.shape} {init_box_proposal}')
+
 
             # gather tgt
             tgt_undetach = torch.gather(
@@ -349,6 +391,7 @@ class Transformer(nn.Module):
                 tgt = tgt_embed + tgt_pat
 
             init_box_proposal = refpoint_embed_.sigmoid()
+            # print(f'[Transformer encoder two-stage=no] init_box_proposal={init_box_proposal.shape} {init_box_proposal[0,300,:]}')
 
         else:
             raise NotImplementedError("unknown two_stage_type {}".format(self.two_stage_type))
@@ -362,10 +405,12 @@ class Transformer(nn.Module):
         # Begin Decoder
         #########################################################
         hs, references = self.decoder(
+            bboxes=bboxes,
             tgt=tgt.transpose(0, 1),
             memory=memory.transpose(0, 1),
             memory_key_padding_mask=mask_flatten,
             pos=lvl_pos_embed_flatten.transpose(0, 1),
+            #refpoints_unsigmoid=init_box_proposal.transpose(0, 1),
             refpoints_unsigmoid=refpoint_embed.transpose(0, 1),
             level_start_index=level_start_index,
             spatial_shapes=spatial_shapes,
@@ -463,9 +508,14 @@ class TransformerEncoder(nn.Module):
         self.use_transformer_ckpt = use_transformer_ckpt
 
     @staticmethod
-    def get_reference_points(spatial_shapes, valid_ratios, device):
+    def get_reference_points(bboxes, spatial_shapes, valid_ratios, device):
+        # print(f'[TransformerEncoder get_reference_points] spatial_shapes={spatial_shapes}')
+        # print(f'[TransformerEncoder get_reference_points] valid_ratios={valid_ratios}')
         reference_points_list = []
         for lvl, (H_, W_) in enumerate(spatial_shapes):
+            
+            # print(f'[TransformerEncoder get_reference_points] lvl={lvl}, H_={H_}')
+            # print(f'[TransformerEncoder get_reference_points] lvl={lvl}, W_={W_}')
 
             ref_y, ref_x = torch.meshgrid(
                 torch.linspace(0.5, H_ - 0.5, H_, dtype=torch.float32, device=device),
@@ -477,10 +527,13 @@ class TransformerEncoder(nn.Module):
             reference_points_list.append(ref)
         reference_points = torch.cat(reference_points_list, 1)
         reference_points = reference_points[:, :, None] * valid_ratios[:, None]
+
+        # print(f'[TransformerEncoder get_reference_points] reference_points={reference_points.shape}, {reference_points[:5]}')
         return reference_points
 
     def forward(
         self,
+        bboxes,
         # for images
         src: Tensor,
         pos: Tensor,
@@ -521,7 +574,7 @@ class TransformerEncoder(nn.Module):
         # preparation and reshape
         if self.num_layers > 0:
             reference_points = self.get_reference_points(
-                spatial_shapes, valid_ratios, device=src.device
+                bboxes, spatial_shapes, valid_ratios, device=src.device
             )
 
         if self.text_layers:
@@ -595,6 +648,34 @@ class TransformerEncoder(nn.Module):
         return output, memory_text
 
 
+def convert_ratio(bboxes, w, h):
+    # mask = torch.zeros(h,w).unsqueeze(0).bool()
+    mask = torch.ones(h,w).unsqueeze(0).bool()
+    for x_center_ratio, y_center_ratio, w_ratio, h_ratio in bboxes:
+
+        # -1 help converting to idx
+        # x_left = math.floor((x_center_ratio - w_ratio/2.0) * w)-1
+        # x_right = math.ceil((x_center_ratio + w_ratio/2.0) * w)-1
+        # y_top = math.floor((y_center_ratio - h_ratio/2.0) * h)-1
+        # y_down = math.ceil((y_center_ratio + h_ratio/2.0) * h)-1
+        x_left = int(torch.round((x_center_ratio - w_ratio/2.0) * w).item()-1)
+        x_right = int(torch.round((x_center_ratio + w_ratio/2.0) * w).item()-1)
+        y_top = int(torch.round((y_center_ratio - h_ratio/2.0) * h).item()-1)
+        y_down = int(torch.round((y_center_ratio + h_ratio/2.0) * h).item()-1)
+
+        x_left = 0 if x_left < 0 else x_left
+        x_right = w-1 if x_right > w else x_right
+        y_top = 0 if y_top < 0 else y_top
+        y_down = h-1 if y_down > h else y_down
+
+        # mask[:,y_top:y_down+1,x_left:x_right+1] = True
+        mask[:,y_top:y_down+1,x_left:x_right+1] = False
+        # print(f'w={w}, h={h}, [:,{y_top}:{y_down+1},{x_left}:{x_right+1}]')
+
+    
+    return mask
+
+
 class TransformerDecoder(nn.Module):
     def __init__(
         self,
@@ -632,6 +713,7 @@ class TransformerDecoder(nn.Module):
 
     def forward(
         self,
+        bboxes,
         tgt,
         memory,
         tgt_mask: Optional[Tensor] = None,
@@ -658,8 +740,28 @@ class TransformerDecoder(nn.Module):
         """
         output = tgt
 
+        # print(f'[TransformerDecoder forward] tgt={tgt.shape}')
+        # print(f'[TransformerDecoder forward] memory={memory.shape}')
+        # print(f'[TransformerDecoder forward] pos={pos.shape}, {pos[:5]}')
+        # print(f'[TransformerDecoder forward] refpoints_unsigmoid={refpoints_unsigmoid.shape}')
+
         intermediate = []
         reference_points = refpoints_unsigmoid.sigmoid()
+
+        ################################
+        #             hack             #
+        ################################
+        gt_points = torch.Tensor(bboxes).unsqueeze(1).to('cuda:0')
+        num_padding = reference_points.shape[0] - gt_points.shape[0]
+        # padding = torch.Tensor([[float("-inf"), float("-inf"), float("-inf"), float("-inf")]]*num_padding).unsqueeze(1).to('cuda:0')
+        # padding = torch.Tensor([[float("inf"), float("inf"), float("inf"), float("inf")]]*num_padding).unsqueeze(1).to('cuda:0')
+        
+        # padding the rest to zero, +-inf not working
+        padding = torch.Tensor([[float(0), float(0), float(0), float(0)]]*num_padding).unsqueeze(1).to('cuda:0')
+
+        # overwrite original reference_points
+        reference_points = torch.cat((gt_points, padding), 0)
+
         ref_points = [reference_points]
 
         for layer_id, layer in enumerate(self.layers):
